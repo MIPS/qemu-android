@@ -504,8 +504,7 @@ static void goldfish_fb_write(void *opaque, target_phys_addr_t offset,
             s->int_enable = val;
             goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
             break;
-        case FB_SET_BASE: {
-            int need_resize = !s->base_valid;
+        case FB_SET_BASE:
             s->fb_base = val;
             s->int_status &= ~FB_INT_BASE_UPDATE_DONE;
             s->need_update = 1;
@@ -514,14 +513,9 @@ static void goldfish_fb_write(void *opaque, target_phys_addr_t offset,
             if(s->set_rotation != s->rotation) {
                 //printf("FB_SET_BASE: rotation : %d => %d\n", s->rotation, s->set_rotation);
                 s->rotation = s->set_rotation;
-                need_resize = 1;
             }
             goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
-            if (need_resize) {
-                //printf("FB_SET_BASE: need resize (rotation=%d)\n", s->rotation );
-                dpy_resize(s->ds);
-            }
-            } break;
+            break;
         case FB_SET_ROTATION:
             //printf( "FB_SET_ROTATION %d\n", val);
             s->set_rotation = val;
