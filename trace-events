@@ -1252,3 +1252,9 @@ xen_pv_mmio_write(uint64_t addr) "WARNING: write to Xen PV Device MMIO space (ad
 # hw/pci/pci_host.c
 pci_cfg_read(const char *dev, unsigned devid, unsigned fnid, unsigned offs, unsigned val) "%s %02u:%u @0x%x -> 0x%x"
 pci_cfg_write(const char *dev, unsigned devid, unsigned fnid, unsigned offs, unsigned val) "%s %02u:%u @0x%x <- 0x%x"
+
+# hw/display/goldfish_fb.c
+goldfish_fb_memory_read(uint32_t addr, uint32_t value) "addr %08x value %08x"
+goldfish_fb_memory_write(uint32_t addr, uint32_t value) "addr %08x value %08x"
+goldfish_fb_update_display(int y, int h, int x, int w) "y:%d,h:%d,x=%d,w=%d"
+goldfish_fb_update_stats(float peak, float total) "peak %.2f %%  total %.2f %%"

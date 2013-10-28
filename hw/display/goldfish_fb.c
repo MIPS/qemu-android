@@ -1,4 +1,4 @@
-/* Copyright (C) 2007-2008 The Android Open Source Project
+/* Copyright (C) 2007-2013 The Android Open Source Project
 **
 ** This software is licensed under the terms of the GNU General Public
 ** License version 2, as published by the Free Software Foundation, and
@@ -9,12 +9,27 @@
 ** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 ** GNU General Public License for more details.
 */
-#include "qemu_file.h"
-#include "android/android.h"
-#include "android/utils/debug.h"
-#include "android/utils/duff.h"
-#include "goldfish_device.h"
-#include "console.h"
+#include "framebuffer.h"
+#include "hw/hw.h"
+#include "hw/sysbus.h"
+#include "ui/console.h"
+#include "ui/pixel_ops.h"
+#include "trace.h"
+
+/* milkymist-vgafb also uses RGB565, so borrow its drawfn helpers */
+#define BITS 8
+#include "milkymist-vgafb_template.h"
+#define BITS 15
+#include "milkymist-vgafb_template.h"
+#define BITS 16
+#include "milkymist-vgafb_template.h"
+#define BITS 24
+#include "milkymist-vgafb_template.h"
+#define BITS 32
+#include "milkymist-vgafb_template.h"
+
+#define TYPE_GOLDFISH_FB "goldfish_fb"
+#define GOLDFISH_FB(obj) OBJECT_CHECK(struct goldfish_fb_state, (obj), TYPE_GOLDFISH_FB)
 
 enum {
     FB_GET_WIDTH        = 0x00,
@@ -32,8 +47,12 @@ enum {
 };
 
 struct goldfish_fb_state {
-    struct goldfish_device dev;
-    DisplayState*  ds;
+    SysBusDevice parent;
+
+    QemuConsole *con;
+    MemoryRegion iomem;
+    qemu_irq irq;
+
     uint32_t fb_base;
     uint32_t base_valid : 1;
     uint32_t need_update : 1;
@@ -52,11 +71,11 @@ static void goldfish_fb_save(QEMUFile*  f, void*  opaque)
 {
     struct goldfish_fb_state*  s = opaque;
 
-    DisplayState*  ds = s->ds;
+    DisplaySurface *ds = qemu_console_surface(s->con);
 
-    qemu_put_be32(f, ds->surface->width);
-    qemu_put_be32(f, ds->surface->height);
-    qemu_put_be32(f, ds->surface->linesize);
+    qemu_put_be32(f, surface_width(ds));
+    qemu_put_be32(f, surface_height(ds));
+    qemu_put_be32(f, surface_stride(ds));
     qemu_put_byte(f, 0);
 
     qemu_put_be32(f, s->fb_base);
@@ -85,11 +104,11 @@ static int  goldfish_fb_load(QEMUFile*  f, void*  opaque, int  version_id)
     ds_pitch = qemu_get_be32(f);
     ds_rot   = qemu_get_byte(f);
 
-    DisplayState*  ds = s->ds;
+    DisplaySurface *ds = qemu_console_surface(s->con);
 
-    if (ds->surface->width != ds_w ||
-        ds->surface->height != ds_h ||
-        ds->surface->linesize != ds_pitch ||
+    if (surface_width(ds) != ds_w ||
+        surface_height(ds) != ds_h ||
+        surface_stride(ds) != ds_pitch ||
         ds_rot != 0)
     {
         /* XXX: We should be able to force a resize/rotation from here ? */
@@ -137,239 +156,19 @@ static int   stats_full_updates;
 static long  stats_total_full_updates;
 #endif
 
-/* This structure is used to hold the inputs for
- * compute_fb_update_rect_linear below.
- * This corresponds to the source framebuffer and destination
- * surface pixel buffers.
- */
-typedef struct {
-    int            width;
-    int            height;
-    int            bytes_per_pixel;
-    const uint8_t* src_pixels;
-    int            src_pitch;
-    uint8_t*       dst_pixels;
-    int            dst_pitch;
-} FbUpdateState;
-
-/* This structure is used to hold the outputs for
- * compute_fb_update_rect_linear below.
- * This corresponds to the smalled bounding rectangle of the
- * latest framebuffer update.
- */
-typedef struct {
-    int xmin, ymin, xmax, ymax;
-} FbUpdateRect;
-
-/* Determine the smallest bounding rectangle of pixels which changed
- * between the source (framebuffer) and destination (surface) pixel
- * buffers.
- *
- * Return 0 if there was no change, otherwise, populate '*rect'
- * and return 1.
- *
- * If 'dirty_base' is not 0, it is a physical address that will be
- * used to speed-up the check using the VGA dirty bits. In practice
- * this is only used if your kernel driver does not implement.
- *
- * This function assumes that the framebuffers are in linear memory.
- * This may change later when we want to support larger framebuffers
- * that exceed the max DMA aperture size though.
- */
-static int
-compute_fb_update_rect_linear(FbUpdateState*  fbs,
-                              uint32_t        dirty_base,
-                              FbUpdateRect*   rect)
-{
-    int  yy;
-    int  width = fbs->width;
-    const uint8_t* src_line = fbs->src_pixels;
-    uint8_t*       dst_line = fbs->dst_pixels;
-    uint32_t       dirty_addr = dirty_base;
-    rect->xmin = rect->ymin = INT_MAX;
-    rect->xmax = rect->ymax = INT_MIN;
-    for (yy = 0; yy < fbs->height; yy++) {
-        int xx1, xx2;
-        /* If dirty_addr is != 0, then use it as a physical address to
-         * use the VGA dirty bits table to speed up the detection of
-         * changed pixels.
-         */
-        if (dirty_addr != 0) {
-            int  dirty = 0;
-            int  len   = fbs->src_pitch;
-
-            while (len > 0) {
-                int  len2 = TARGET_PAGE_SIZE - (dirty_addr & (TARGET_PAGE_SIZE-1));
-
-                if (len2 > len)
-                    len2 = len;
-
-                dirty |= cpu_physical_memory_get_dirty(dirty_addr, VGA_DIRTY_FLAG);
-                dirty_addr  += len2;
-                len         -= len2;
-            }
-
-            if (!dirty) { /* this line was not modified, skip to next one */
-                goto NEXT_LINE;
-            }
-        }
-
-        /* Then compute actual bounds of the changed pixels, while
-         * copying them from 'src' to 'dst'. This depends on the pixel depth.
-         */
-        switch (fbs->bytes_per_pixel) {
-        case 2:
-        {
-            const uint16_t* src = (const uint16_t*) src_line;
-            uint16_t*       dst = (uint16_t*) dst_line;
-
-            xx1 = 0;
-            DUFF4(width, {
-                uint16_t spix = src[xx1];
-#if defined(HOST_WORDS_BIGENDIAN) != defined(TARGET_WORDS_BIGENDIAN)
-                spix = (uint16_t)((spix << 8) | (spix >> 8));
-#endif
-                if (spix != dst[xx1])
-                    break;
-                xx1++;
-            });
-            if (xx1 == width) {
-                break;
-            }
-            xx2 = width-1;
-            DUFF4(xx2-xx1, {
-                if (src[xx2] != dst[xx2])
-                    break;
-                xx2--;
-            });
-#if defined(HOST_WORDS_BIGENDIAN) != defined(TARGET_WORDS_BIGENDIAN)
-            /* Convert the guest pixels into host ones */
-            int xx = xx1;
-            DUFF4(xx2-xx1+1,{
-                unsigned   spix = src[xx];
-                dst[xx] = (uint16_t)((spix << 8) | (spix >> 8));
-                xx++;
-            });
-#else
-            memcpy( dst+xx1, src+xx1, (xx2-xx1+1)*2 );
-#endif
-            break;
-        }
-
-        case 3:
-        {
-            xx1 = 0;
-            DUFF4(width, {
-                int xx = xx1*3;
-                if (src_line[xx+0] != dst_line[xx+0] ||
-                    src_line[xx+1] != dst_line[xx+1] ||
-                    src_line[xx+2] != dst_line[xx+2]) {
-                    break;
-                }
-                xx1 ++;
-            });
-            if (xx1 == width) {
-                break;
-            }
-            xx2 = width-1;
-            DUFF4(xx2-xx1,{
-                int xx = xx2*3;
-                if (src_line[xx+0] != dst_line[xx+0] ||
-                    src_line[xx+1] != dst_line[xx+1] ||
-                    src_line[xx+2] != dst_line[xx+2]) {
-                    break;
-                }
-                xx2--;
-            });
-            memcpy( dst_line+xx1*3, src_line+xx1*3, (xx2-xx1+1)*3 );
-            break;
-        }
-
-        case 4:
-        {
-            const uint32_t* src = (const uint32_t*) src_line;
-            uint32_t*       dst = (uint32_t*) dst_line;
-
-            xx1 = 0;
-            DUFF4(width, {
-                uint32_t spix = src[xx1];
-#if defined(HOST_WORDS_BIGENDIAN) != defined(TARGET_WORDS_BIGENDIAN)
-                spix = (spix << 16) | (spix >> 16);
-                spix = ((spix << 8) & 0xff00ff00) | ((spix >> 8) & 0x00ff00ff);
-#endif
-                if (spix != dst[xx1]) {
-                    break;
-                }
-                xx1++;
-            });
-            if (xx1 == width) {
-                break;
-            }
-            xx2 = width-1;
-            DUFF4(xx2-xx1,{
-                if (src[xx2] != dst[xx2]) {
-                    break;
-                }
-                xx2--;
-            });
-#if defined(HOST_WORDS_BIGENDIAN) != defined(TARGET_WORDS_BIGENDIAN)
-            /* Convert the guest pixels into host ones */
-            int xx = xx1;
-            DUFF4(xx2-xx1+1,{
-                uint32_t   spix = src[xx];
-                spix = (spix << 16) | (spix >> 16);
-                spix = ((spix << 8) & 0xff00ff00) | ((spix >> 8) & 0x00ff00ff);
-                dst[xx] = spix;
-                xx++;
-            })
-#else
-            memcpy( dst+xx1, src+xx1, (xx2-xx1+1)*4 );
-#endif
-            break;
-        }
-        default:
-            return 0;
-        }
-        /* Update bounds if pixels on this line were modified */
-        if (xx1 < width) {
-            if (xx1 < rect->xmin) rect->xmin = xx1;
-            if (xx2 > rect->xmax) rect->xmax = xx2;
-            if (yy < rect->ymin) rect->ymin = yy;
-            if (yy > rect->ymax) rect->ymax = yy;
-        }
-    NEXT_LINE:
-        src_line += fbs->src_pitch;
-        dst_line += fbs->dst_pitch;
-    }
-
-    if (rect->ymin > rect->ymax) { /* nothing changed */
-        return 0;
-    }
-
-    /* Always clear the dirty VGA bits */
-    cpu_physical_memory_reset_dirty(dirty_base + rect->ymin * fbs->src_pitch,
-                                    dirty_base + (rect->ymax+1)* fbs->src_pitch,
-                                    VGA_DIRTY_FLAG);
-    return 1;
-}
-
-
 static void goldfish_fb_update_display(void *opaque)
 {
     struct goldfish_fb_state *s = (struct goldfish_fb_state *)opaque;
-    uint32_t base;
-    uint8_t*  dst_line;
-    uint8_t*  src_line;
+    DisplaySurface *ds = qemu_console_surface(s->con);
     int full_update = 0;
     int  width, height, pitch;
 
-    base = s->fb_base;
-    if(base == 0)
+    if (!s || !s->con || surface_bits_per_pixel(ds) == 0 || !s->fb_base)
         return;
 
     if((s->int_enable & FB_INT_VSYNC) && !(s->int_status & FB_INT_VSYNC)) {
         s->int_status |= FB_INT_VSYNC;
-        goldfish_device_set_irq(&s->dev, 0, 1);
+        qemu_irq_raise(s->irq);
     }
 
     if(s->need_update) {
@@ -377,31 +176,17 @@ static void goldfish_fb_update_display(void *opaque)
         if(s->need_int) {
             s->int_status |= FB_INT_BASE_UPDATE_DONE;
             if(s->int_enable & FB_INT_BASE_UPDATE_DONE)
-                goldfish_device_set_irq(&s->dev, 0, 1);
+                qemu_irq_raise(s->irq);
         }
         s->need_int = 0;
         s->need_update = 0;
     }
 
-    src_line  = qemu_get_ram_ptr( base );
+    pitch     = surface_stride(ds);
+    width     = surface_width(ds);
+    height    = surface_height(ds);
 
-    dst_line  = s->ds->surface->data;
-    pitch     = s->ds->surface->linesize;
-    width     = s->ds->surface->width;
-    height    = s->ds->surface->height;
-
-    FbUpdateState  fbs;
-    FbUpdateRect   rect;
-
-    fbs.width      = width;
-    fbs.height     = height;
-    fbs.dst_pixels = dst_line;
-    fbs.dst_pitch  = pitch;
-    fbs.bytes_per_pixel = goldfish_fb_get_bytes_per_pixel(s);
-
-    fbs.src_pixels = src_line;
-    fbs.src_pitch  = width*s->ds->surface->pf.bytes_per_pixel;
-
+    int ymin, ymax;
 
 #if STATS
     if (full_update)
@@ -410,8 +195,7 @@ static void goldfish_fb_update_display(void *opaque)
         stats_total               += stats_counter;
         stats_total_full_updates  += stats_full_updates;
 
-        printf( "full update stats:  peak %.2f %%  total %.2f %%\n",
-                stats_full_updates*100.0/stats_counter,
+        trace_goldfish_fb_update_stats(stats_full_updates*100.0/stats_counter,
                 stats_total_full_updates*100.0/stats_total );
 
         stats_counter      = 0;
@@ -421,30 +205,53 @@ static void goldfish_fb_update_display(void *opaque)
 
     if (s->blank)
     {
+        void *dst_line = surface_data(ds);
         memset( dst_line, 0, height*pitch );
-        rect.xmin = 0;
-        rect.ymin = 0;
-        rect.xmax = width-1;
-        rect.ymax = height-1;
+        ymax = height-1;
     }
     else
     {
-        if (full_update) { /* don't use dirty-bits optimization */
-            base = 0;
-        }
-        if (compute_fb_update_rect_linear(&fbs, base, &rect) == 0) {
+        SysBusDevice *dev = SYS_BUS_DEVICE(opaque);
+        MemoryRegion *address_space = sysbus_address_space(dev);
+        int src_width = width * 2;
+        int dest_col_pitch = surface_bytes_per_pixel(ds);
+        int dest_row_pitch = surface_stride(ds);
+        drawfn fn;
+
+        switch (surface_bits_per_pixel(ds)) {
+        case 0:
+            return;
+        case 8:
+            fn = draw_line_8;
+            break;
+        case 15:
+            fn = draw_line_15;
+            break;
+        case 16:
+            fn = draw_line_16;
+            break;
+        case 24:
+            fn = draw_line_24;
+            break;
+        case 32:
+            fn = draw_line_32;
+            break;
+        default:
+            hw_error("goldfish_fb: bad color depth\n");
             return;
         }
+
+        ymin = 0;
+        framebuffer_update_display(ds, address_space, s->fb_base, width, height,
+                src_width, dest_row_pitch, dest_col_pitch, full_update,
+                fn, ds, &ymin, &ymax);
     }
 
-    rect.xmax += 1;
-    rect.ymax += 1;
-#if 0
-    printf("goldfish_fb_update_display (y:%d,h:%d,x=%d,w=%d)\n",
-           rect.ymin, rect.ymax-rect.ymin, rect.xmin, rect.xmax-rect.xmin);
-#endif
-
-    dpy_update(s->ds, rect.xmin, rect.ymin, rect.xmax-rect.xmin, rect.ymax-rect.ymin);
+    ymax += 1;
+    if (ymin >= 0) {
+        trace_goldfish_fb_update_display(ymin, ymax-ymin, 0, width);
+        dpy_gfx_update(s->con, 0, ymin, width, ymax-ymin);
+    }
 }
 
 static void goldfish_fb_invalidate_display(void * opaque)
@@ -454,55 +261,58 @@ static void goldfish_fb_invalidate_display(void * opaque)
     s->need_update = 1;
 }
 
-static uint32_t goldfish_fb_read(void *opaque, target_phys_addr_t offset)
+static uint64_t goldfish_fb_read(void *opaque, hwaddr offset, unsigned size)
 {
-    uint32_t ret;
+    uint64_t ret = 0;
     struct goldfish_fb_state *s = opaque;
+    DisplaySurface *ds = qemu_console_surface(s->con);
 
     switch(offset) {
         case FB_GET_WIDTH:
-            ret = ds_get_width(s->ds);
-            //printf("FB_GET_WIDTH => %d\n", ret);
-            return ret;
+            ret = surface_width(ds);
+            break;
 
         case FB_GET_HEIGHT:
-            ret = ds_get_height(s->ds);
-            //printf( "FB_GET_HEIGHT = %d\n", ret);
-            return ret;
+            ret = surface_height(ds);
+            break;
 
         case FB_INT_STATUS:
             ret = s->int_status & s->int_enable;
             if(ret) {
                 s->int_status &= ~ret;
-                goldfish_device_set_irq(&s->dev, 0, 0);
+                qemu_irq_lower(s->irq);
             }
-            return ret;
+            break;
 
         case FB_GET_PHYS_WIDTH:
-            ret = pixels_to_mm( ds_get_width(s->ds), s->dpi );
-            //printf( "FB_GET_PHYS_WIDTH => %d\n", ret );
-            return ret;
+            ret = pixels_to_mm( surface_width(ds), s->dpi );
+            break;
 
         case FB_GET_PHYS_HEIGHT:
-            ret = pixels_to_mm( ds_get_height(s->ds), s->dpi );
-            //printf( "FB_GET_PHYS_HEIGHT => %d\n", ret );
-            return ret;
+            ret = pixels_to_mm( surface_height(ds), s->dpi );
+            break;
 
         default:
-            cpu_abort (cpu_single_env, "goldfish_fb_read: Bad offset %x\n", offset);
-            return 0;
+            error_report("goldfish_fb_read: Bad offset 0x" TARGET_FMT_plx,
+                    offset);
+            break;
     }
+
+    trace_goldfish_fb_memory_read(offset, ret);
+    return ret;
 }
 
-static void goldfish_fb_write(void *opaque, target_phys_addr_t offset,
-                        uint32_t val)
+static void goldfish_fb_write(void *opaque, hwaddr offset, uint64_t val,
+        unsigned size)
 {
     struct goldfish_fb_state *s = opaque;
+
+    trace_goldfish_fb_memory_write(offset, val);
 
     switch(offset) {
         case FB_INT_ENABLE:
             s->int_enable = val;
-            goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
+            qemu_set_irq(s->irq, s->int_status & s->int_enable);
             break;
         case FB_SET_BASE:
             s->fb_base = val;
@@ -514,10 +324,9 @@ static void goldfish_fb_write(void *opaque, target_phys_addr_t offset,
                 //printf("FB_SET_BASE: rotation : %d => %d\n", s->rotation, s->set_rotation);
                 s->rotation = s->set_rotation;
             }
-            goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
+            qemu_set_irq(s->irq, s->int_status & s->int_enable);
             break;
         case FB_SET_ROTATION:
-            //printf( "FB_SET_ROTATION %d\n", val);
             s->set_rotation = val;
             break;
         case FB_SET_BLANK:
@@ -525,42 +334,64 @@ static void goldfish_fb_write(void *opaque, target_phys_addr_t offset,
             s->need_update = 1;
             break;
         default:
-            cpu_abort (cpu_single_env, "goldfish_fb_write: Bad offset %x\n", offset);
+            error_report("goldfish_fb_write: Bad offset 0x" TARGET_FMT_plx,
+                    offset);
     }
 }
 
-static CPUReadMemoryFunc *goldfish_fb_readfn[] = {
-   goldfish_fb_read,
-   goldfish_fb_read,
-   goldfish_fb_read
+static const MemoryRegionOps goldfish_fb_iomem_ops = {
+    .read = goldfish_fb_read,
+    .write = goldfish_fb_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
 };
 
-static CPUWriteMemoryFunc *goldfish_fb_writefn[] = {
-   goldfish_fb_write,
-   goldfish_fb_write,
-   goldfish_fb_write
+static const GraphicHwOps goldfish_fb_ops = {
+    .invalidate = goldfish_fb_invalidate_display,
+    .gfx_update = goldfish_fb_update_display,
 };
 
-void goldfish_fb_init(int id)
+static int goldfish_fb_init(SysBusDevice *sbdev)
 {
-    struct goldfish_fb_state *s;
+    DeviceState *dev = DEVICE(sbdev);
+    struct goldfish_fb_state *s = GOLDFISH_FB(dev);
 
-    s = (struct goldfish_fb_state *)qemu_mallocz(sizeof(*s));
-    s->dev.name = "goldfish_fb";
-    s->dev.id = id;
-    s->dev.size = 0x1000;
-    s->dev.irq_count = 1;
+    sysbus_init_irq(sbdev, &s->irq);
 
-    s->ds = graphic_console_init(goldfish_fb_update_display,
-                                 goldfish_fb_invalidate_display,
-                                 NULL,
-                                 NULL,
-                                 s);
+    s->con = graphic_console_init(dev, 0, &goldfish_fb_ops, s);
 
     s->dpi = 165;  /* XXX: Find better way to get actual value ! */
 
-    goldfish_device_add(&s->dev, goldfish_fb_readfn, goldfish_fb_writefn, s);
+    memory_region_init_io(&s->iomem, OBJECT(s), &goldfish_fb_iomem_ops, s,
+            "goldfish_fb", 0x100);
+    sysbus_init_mmio(sbdev, &s->iomem);
 
-    register_savevm( "goldfish_fb", 0, GOLDFISH_FB_SAVE_VERSION,
+    register_savevm(dev, "goldfish_fb", 0, GOLDFISH_FB_SAVE_VERSION,
                      goldfish_fb_save, goldfish_fb_load, s);
+
+    return 0;
 }
+
+static void goldfish_fb_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
+
+    k->init = goldfish_fb_init;
+    dc->desc = "goldfish framebuffer";
+}
+
+static const TypeInfo goldfish_fb_info = {
+    .name          = TYPE_GOLDFISH_FB,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(struct goldfish_fb_state),
+    .class_init    = goldfish_fb_class_init,
+};
+
+static void goldfish_fb_register(void)
+{
+    type_register_static(&goldfish_fb_info);
+}
+
+type_init(goldfish_fb_register);
