@@ -16,19 +16,6 @@
 #include "goldfish_device.h"
 #include "console.h"
 
-/* These values *must* match the platform definitions found under
- * hardware/libhardware/include/hardware/hardware.h
- */
-enum {
-    HAL_PIXEL_FORMAT_RGBA_8888          = 1,
-    HAL_PIXEL_FORMAT_RGBX_8888          = 2,
-    HAL_PIXEL_FORMAT_RGB_888            = 3,
-    HAL_PIXEL_FORMAT_RGB_565            = 4,
-    HAL_PIXEL_FORMAT_BGRA_8888          = 5,
-    HAL_PIXEL_FORMAT_RGBA_5551          = 6,
-    HAL_PIXEL_FORMAT_RGBA_4444          = 7,
-};
-
 enum {
     FB_GET_WIDTH        = 0x00,
     FB_GET_HEIGHT       = 0x04,
@@ -39,7 +26,6 @@ enum {
     FB_SET_BLANK        = 0x18,
     FB_GET_PHYS_WIDTH   = 0x1c,
     FB_GET_PHYS_HEIGHT  = 0x20,
-    FB_GET_FORMAT       = 0x24,
 
     FB_INT_VSYNC             = 1U << 0,
     FB_INT_BASE_UPDATE_DONE  = 1U << 1
@@ -48,8 +34,6 @@ enum {
 struct goldfish_fb_state {
     struct goldfish_device dev;
     DisplayState*  ds;
-    int      pixel_format;
-    int      bytes_per_pixel;
     uint32_t fb_base;
     uint32_t base_valid : 1;
     uint32_t need_update : 1;
@@ -130,84 +114,6 @@ static int  goldfish_fb_load(QEMUFile*  f, void*  opaque, int  version_id)
     ret = 0;
 Exit:
     return ret;
-}
-
-/* Type used to record a mapping from display surface pixel format to
- * HAL pixel format */
-typedef struct {
-    int    pixel_format; /* HAL pixel format */
-    uint8_t bits;
-    uint8_t bytes;
-    uint32_t rmask, gmask, bmask, amask;
-} FbConfig;
-
-
-/* Return the pixel format of the current framebuffer, based on
- * the current display surface's pixel format.
- *
- * Note that you should not call this function from the device initialization
- * function, because the display surface will change format before the kernel
- * start.
- */
-static int goldfish_fb_get_pixel_format(struct goldfish_fb_state *s)
-{
-    if (s->pixel_format >= 0) {
-        return s->pixel_format;
-    }
-    static const FbConfig fb_configs[] = {
-        { HAL_PIXEL_FORMAT_RGB_565, 16, 2, 0xf800, 0x7e0, 0x1f, 0x0 },
-        { HAL_PIXEL_FORMAT_RGBX_8888, 32, 4, 0xff0000, 0xff00, 0xff, 0x0 },
-        { HAL_PIXEL_FORMAT_RGBA_8888, 32, 4, 0xff0000, 0xff00, 0xff, 0xff000000 },
-        { -1, }
-    };
-
-    /* Determine HAL pixel format value based on s->ds */
-    struct PixelFormat* pf = &s->ds->surface->pf;
-    if (VERBOSE_CHECK(init)) {
-        printf("%s:%d: display surface,pixel format:\n", __FUNCTION__, __LINE__);
-        printf("  bits/pixel:  %d\n", pf->bits_per_pixel);
-        printf("  bytes/pixel: %d\n", pf->bytes_per_pixel);
-        printf("  depth:       %d\n", pf->depth);
-        printf("  red:         bits=%d mask=0x%x shift=%d max=0x%x\n",
-            pf->rbits, pf->rmask, pf->rshift, pf->rmax);
-        printf("  green:       bits=%d mask=0x%x shift=%d max=0x%x\n",
-            pf->gbits, pf->gmask, pf->gshift, pf->gmax);
-        printf("  blue:        bits=%d mask=0x%x shift=%d max=0x%x\n",
-            pf->bbits, pf->bmask, pf->bshift, pf->bmax);
-        printf("  alpha:       bits=%d mask=0x%x shift=%d max=0x%x\n",
-            pf->abits, pf->amask, pf->ashift, pf->amax);
-    }
-
-    s->bytes_per_pixel = pf->bytes_per_pixel;
-    int nn;
-    for (nn = 0; fb_configs[nn].pixel_format >= 0; nn++) {
-        const FbConfig* fbc = &fb_configs[nn];
-        if (pf->bits_per_pixel == fbc->bits &&
-            pf->bytes_per_pixel == fbc->bytes &&
-            pf->rmask == fbc->rmask &&
-            pf->gmask == fbc->gmask &&
-            pf->bmask == fbc->bmask &&
-            pf->amask == fbc->amask) {
-            /* We found it */
-            s->pixel_format = fbc->pixel_format;
-            return s->pixel_format;
-        }
-    }
-    fprintf(stderr, "%s:%d: Unsupported display pixel format (depth=%d, bytespp=%d, bitspp=%d)\n",
-                __FUNCTION__, __LINE__,
-                pf->depth,
-                pf->bytes_per_pixel,
-                pf->bits_per_pixel);
-    exit(1);
-    return -1;
-}
-
-static int goldfish_fb_get_bytes_per_pixel(struct goldfish_fb_state *s)
-{
-    if (s->pixel_format < 0) {
-        (void) goldfish_fb_get_pixel_format(s);
-    }
-    return s->bytes_per_pixel;
 }
 
 static int
@@ -582,9 +488,6 @@ static uint32_t goldfish_fb_read(void *opaque, target_phys_addr_t offset)
             //printf( "FB_GET_PHYS_HEIGHT => %d\n", ret );
             return ret;
 
-        case FB_GET_FORMAT:
-            return goldfish_fb_get_pixel_format(s);
-
         default:
             cpu_abort (cpu_single_env, "goldfish_fb_read: Bad offset %x\n", offset);
             return 0;
@@ -661,12 +564,6 @@ void goldfish_fb_init(int id)
                                  s);
 
     s->dpi = 165;  /* XXX: Find better way to get actual value ! */
-
-    /* IMPORTANT: DO NOT COMPUTE s->pixel_format and s->bytes_per_pixel
-     * here because the display surface is going to change later.
-     */
-    s->bytes_per_pixel = 0;
-    s->pixel_format    = -1;
 
     goldfish_device_add(&s->dev, goldfish_fb_readfn, goldfish_fb_writefn, s);
 
