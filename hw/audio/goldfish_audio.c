@@ -25,12 +25,6 @@
 
 extern void  dprint(const char*  fmt, ...);
 
-/* define USE_QEMU_AUDIO_IN to 1 to use QEMU's audio subsystem to
- * implement the audio input. if 0, this will try to read a .wav file
- * directly...
- */
-#define  USE_QEMU_AUDIO_IN  1
-
 enum {
 	/* audio status register */
 	AUDIO_INT_STATUS	= 0x00,
@@ -78,7 +72,6 @@ struct goldfish_audio_state {
     // irq enable mask for int_status
     uint32_t int_enable;
 
-#ifndef USE_QEMU_AUDIO_IN
     // address of the read buffer
     uint32_t read_buffer;
     // path to file or device to use for input
@@ -89,7 +82,6 @@ struct goldfish_audio_state {
     int input_is_stereo;
     // file descriptor to use for input
     int input_fd;
-#endif
 
     // number of bytes available in the read buffer
     int read_buffer_available;
@@ -105,9 +97,7 @@ struct goldfish_audio_state {
     // for QEMU sound output
     QEMUSoundCard card;
     SWVoiceOut *voice;
-#if USE_QEMU_AUDIO_IN
     SWVoiceIn*  voicein;
-#endif
 };
 
 static void
@@ -282,85 +272,12 @@ static void enable_audio(struct goldfish_audio_state *s, int enable)
     s->current_buffer = 0;
 }
 
-#if USE_QEMU_AUDIO_IN
 static void start_read(struct goldfish_audio_state *s, uint32_t count)
 {
     //printf( "... goldfish audio start_read, count=%d\n", count );
     goldfish_audio_buff_set_length( s->in_buff, count );
     s->read_buffer_available = count;
 }
-#else
-static void start_read(struct goldfish_audio_state *s, uint32_t count)
-{
-    uint8   wav_header[44];
-    int result;
-
-    if (!s->input_source) return;
-
-    if (s->input_fd < 0) {
-        s->input_fd = open(s->input_source, O_BINARY | O_RDONLY);
-
-        if (s->input_fd < 0) {
-            fprintf(stderr, "goldfish_audio could not open %s for audio input\n", s->input_source);
-            s->input_source = NULL; // set to to avoid endless retries
-            return;
-        }
-
-        // skip WAV header if we have a WAV file
-        if (s->input_is_wav) {
-            if (read(s->input_fd, wav_header, sizeof(wav_header)) != sizeof(wav_header)) {
-                fprintf(stderr, "goldfish_audio could not read WAV file header %s\n", s->input_source);
-                s->input_fd = -1;
-                s->input_source = NULL; // set to to avoid endless retries
-                return;
-            }
-
-            // is the WAV file stereo?
-            s->input_is_stereo = (wav_header[22] == 2);
-        } else {
-            // assume input from an audio device is stereo
-            s->input_is_stereo = 1;
-        }
-    }
-
-    uint8* buffer = (uint8*)phys_ram_base + s->read_buffer;
-    if (s->input_is_stereo) {
-        // need to read twice as much data
-        count *= 2;
-    }
-
-try_again:
-    result = read(s->input_fd, buffer, count);
-    if (result == 0 && s->input_is_wav) {
-        // end of file, so seek back to the beginning
-       lseek(s->input_fd, sizeof(wav_header), SEEK_SET);
-       goto try_again;
-    }
-
-    if (result > 0 && s->input_is_stereo) {
-        // we need to convert stereo to mono
-        uint8* src  = (uint8*)buffer;
-        uint8* dest = src;
-        int count = result/2;
-        while (count-- > 0) {
-            int  sample1 = src[0] | (src[1] << 8);
-            int  sample2 = src[2] | (src[3] << 8);
-            int  sample  = (sample1 + sample2) >> 1;
-            dst[0] = (uint8_t) sample;
-            dst[1] = (uint8_t)(sample >> 8);
-            src   += 4;
-            dst   += 2;
-        }
-
-        // we reduced the number of bytes by 2
-        result /= 2;
-    }
-
-    s->read_buffer_available = (result > 0 ? result : 0);
-    s->int_status |= AUDIO_INT_READ_BUFFER_FULL;
-    goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
-}
-#endif
 
 static uint32_t goldfish_audio_read(void *opaque, target_phys_addr_t offset)
 {
@@ -376,13 +293,9 @@ static uint32_t goldfish_audio_read(void *opaque, target_phys_addr_t offset)
             return ret;
 
 	case AUDIO_READ_SUPPORTED:
-#if USE_QEMU_AUDIO_IN
             D("%s: AUDIO_READ_SUPPORTED returns %d", __FUNCTION__,
               (s->voicein != NULL));
             return (s->voicein != NULL);
-#else
-            return (s->input_source ? 1 : 0);
-#endif
 
 	case AUDIO_READ_BUFFER_AVAILABLE:
             D("%s: AUDIO_READ_BUFFER_AVAILABLE returns %d", __FUNCTION__,
@@ -501,7 +414,6 @@ static void goldfish_audio_callback(void *opaque, int free)
     }
 }
 
-#if USE_QEMU_AUDIO_IN
 static void
 goldfish_audio_in_callback(void *opaque, int avail)
 {
@@ -531,7 +443,6 @@ goldfish_audio_in_callback(void *opaque, int avail)
         goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
     }
 }
-#endif /* USE_QEMU_AUDIO_IN */
 
 static CPUReadMemoryFunc *goldfish_audio_readfn[] = {
    goldfish_audio_read,
@@ -561,17 +472,6 @@ void goldfish_audio_init(uint32_t base, int id, const char* input_source)
     s->dev.size = 0x1000;
     s->dev.irq_count = 1;
 
-#ifndef USE_QEMU_AUDIO_IN
-    s->input_fd = -1;
-    if (input_source) {
-        s->input_source = input_source;
-        char* extension = strrchr(input_source, '.');
-        if (extension && strcasecmp(extension, ".wav") == 0) {
-            s->input_is_wav = 1;
-        }
-     }
-#endif
-
     AUD_register_card( "goldfish_audio", &s->card);
 
     as.freq = 44100;
@@ -594,7 +494,6 @@ void goldfish_audio_init(uint32_t base, int id, const char* input_source)
         }
     }
 
-#if USE_QEMU_AUDIO_IN
     as.freq       = 8000;
     as.nchannels  = 1;
     as.fmt        = AUD_FMT_S16;
@@ -613,7 +512,6 @@ void goldfish_audio_init(uint32_t base, int id, const char* input_source)
             dprint("warning: opening audio input failed\n");
         }
     }
-#endif
 
     goldfish_audio_buff_init( s->out_buff1 );
     goldfish_audio_buff_init( s->out_buff2 );
