@@ -1,4 +1,4 @@
-/* Copyright (C) 2007-2008 The Android Open Source Project
+/* Copyright (C) 2007-2013 The Android Open Source Project
 **
 ** This software is licensed under the terms of the GNU General Public
 ** License version 2, as published by the Free Software Foundation, and
@@ -9,10 +9,9 @@
 ** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 ** GNU General Public License for more details.
 */
-#include "qemu_file.h"
-#include "goldfish_device.h"
-#include "power_supply.h"
-
+#include "hw/hw.h"
+#include "hw/sysbus.h"
+#include "qemu/error-report.h"
 
 enum {
 	/* status register */
@@ -31,57 +30,53 @@ enum {
 	BATTERY_INT_MASK        = BATTERY_STATUS_CHANGED | AC_STATUS_CHANGED,
 };
 
+const uint32_t POWER_SUPPLY_STATUS_CHARGING = 1;
+const uint32_t POWER_SUPPLY_HEALTH_GOOD = 1;
+
+#define TYPE_GOLDFISH_BATTERY "goldfish_battery"
+#define GOLDFISH_BATTERY(obj) OBJECT_CHECK(struct goldfish_battery_state, (obj), TYPE_GOLDFISH_BATTERY)
 
 struct goldfish_battery_state {
-    struct goldfish_device dev;
+    SysBusDevice parent;
+
+    MemoryRegion iomem;
+    qemu_irq irq;
+
     // IRQs
     uint32_t int_status;
     // irq enable mask for int_status
     uint32_t int_enable;
 
-    int ac_online;
-    int status;
-    int health;
-    int present;
-    int capacity;
+    uint32_t ac_online;
+    uint32_t status;
+    uint32_t health;
+    uint32_t present;
+    uint32_t capacity;
 };
 
 /* update this each time you update the battery_state struct */
 #define  BATTERY_STATE_SAVE_VERSION  1
 
-#define  QFIELD_STRUCT  struct goldfish_battery_state
-QFIELD_BEGIN(goldfish_battery_fields)
-    QFIELD_INT32(int_status),
-    QFIELD_INT32(int_enable),
-    QFIELD_INT32(ac_online),
-    QFIELD_INT32(status),
-    QFIELD_INT32(health),
-    QFIELD_INT32(present),
-    QFIELD_INT32(capacity),
-QFIELD_END
+static const VMStateDescription goldfish_battery_vmsd = {
+    .name = "goldfish_battery",
+    .version_id = BATTERY_STATE_SAVE_VERSION,
+    .minimum_version_id = BATTERY_STATE_SAVE_VERSION,
+    .minimum_version_id_old = BATTERY_STATE_SAVE_VERSION,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(int_status, struct goldfish_battery_state),
+        VMSTATE_UINT32(int_enable, struct goldfish_battery_state),
+        VMSTATE_UINT32(ac_online, struct goldfish_battery_state),
+        VMSTATE_UINT32(status, struct goldfish_battery_state),
+        VMSTATE_UINT32(health, struct goldfish_battery_state),
+        VMSTATE_UINT32(present, struct goldfish_battery_state),
+        VMSTATE_UINT32(capacity, struct goldfish_battery_state),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
-static void  goldfish_battery_save(QEMUFile*  f, void* opaque)
+static uint64_t goldfish_battery_read(void *opaque, hwaddr offset, unsigned size)
 {
-    struct goldfish_battery_state*  s = opaque;
-
-    qemu_put_struct(f, goldfish_battery_fields, s);
-}
-
-static int   goldfish_battery_load(QEMUFile*  f, void*  opaque, int  version_id)
-{
-    struct goldfish_battery_state*  s = opaque;
-
-    if (version_id != BATTERY_STATE_SAVE_VERSION)
-        return -1;
-
-    return qemu_get_struct(f, goldfish_battery_fields, s);
-}
-
-static struct goldfish_battery_state *battery_state;
-
-static uint32_t goldfish_battery_read(void *opaque, target_phys_addr_t offset)
-{
-    uint32_t ret;
+    uint64_t ret;
     struct goldfish_battery_state *s = opaque;
 
     switch(offset) {
@@ -89,7 +84,7 @@ static uint32_t goldfish_battery_read(void *opaque, target_phys_addr_t offset)
             // return current buffer status flags
             ret = s->int_status & s->int_enable;
             if (ret) {
-                goldfish_device_set_irq(&s->dev, 0, 0);
+                qemu_irq_lower(s->irq);
                 s->int_status = 0;
             }
             return ret;
@@ -108,12 +103,14 @@ static uint32_t goldfish_battery_read(void *opaque, target_phys_addr_t offset)
 		    return s->capacity;
 
         default:
-            cpu_abort (cpu_single_env, "goldfish_battery_read: Bad offset %x\n", offset);
+            error_report ("goldfish_battery_read: Bad offset " TARGET_FMT_plx,
+                    offset);
             return 0;
     }
 }
 
-static void goldfish_battery_write(void *opaque, target_phys_addr_t offset, uint32_t val)
+static void goldfish_battery_write(void *opaque, hwaddr offset, uint64_t val,
+        unsigned size)
 {
     struct goldfish_battery_state *s = opaque;
 
@@ -121,37 +118,31 @@ static void goldfish_battery_write(void *opaque, target_phys_addr_t offset, uint
         case BATTERY_INT_ENABLE:
             /* enable interrupts */
             s->int_enable = val;
-//            s->int_status = (AUDIO_INT_WRITE_BUFFER_1_EMPTY | AUDIO_INT_WRITE_BUFFER_2_EMPTY);
-//            goldfish_device_set_irq(&s->dev, 0, (s->int_status & s->int_enable));
             break;
 
         default:
-            cpu_abort (cpu_single_env, "goldfish_audio_write: Bad offset %x\n", offset);
+            error_report ("goldfish_audio_write: Bad offset " TARGET_FMT_plx,
+                    offset);
     }
 }
 
-static CPUReadMemoryFunc *goldfish_battery_readfn[] = {
-    goldfish_battery_read,
-    goldfish_battery_read,
-    goldfish_battery_read
+static const MemoryRegionOps goldfish_battery_iomem_ops = {
+    .read = goldfish_battery_read,
+    .write = goldfish_battery_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
 };
 
-
-static CPUWriteMemoryFunc *goldfish_battery_writefn[] = {
-    goldfish_battery_write,
-    goldfish_battery_write,
-    goldfish_battery_write
-};
-
-void goldfish_battery_init()
+static void goldfish_battery_realize(DeviceState *dev, Error **errp)
 {
-    struct goldfish_battery_state *s;
+    SysBusDevice *sbdev = SYS_BUS_DEVICE(dev);
+    struct goldfish_battery_state *s = GOLDFISH_BATTERY(dev);
 
-    s = (struct goldfish_battery_state *)qemu_mallocz(sizeof(*s));
-    s->dev.name = "goldfish-battery";
-    s->dev.base = 0;    // will be allocated dynamically
-    s->dev.size = 0x1000;
-    s->dev.irq_count = 1;
+    memory_region_init_io(&s->iomem, OBJECT(s), &goldfish_battery_iomem_ops, s,
+            "goldfish_battery", 0x1000);
+    sysbus_init_mmio(sbdev, &s->iomem);
+    sysbus_init_irq(sbdev, &s->irq);
 
     // default values for the battery
     s->ac_online = 1;
@@ -159,102 +150,27 @@ void goldfish_battery_init()
     s->health = POWER_SUPPLY_HEALTH_GOOD;
     s->present = 1;     // battery is present
     s->capacity = 50;   // 50% charged
-
-    battery_state = s;
-
-    goldfish_device_add(&s->dev, goldfish_battery_readfn, goldfish_battery_writefn, s);
-
-    register_savevm( "battery_state", 0, BATTERY_STATE_SAVE_VERSION,
-                     goldfish_battery_save, goldfish_battery_load, s);
 }
 
-void goldfish_battery_set_prop(int ac, int property, int value)
+static void goldfish_battery_class_init(ObjectClass *klass, void *data)
 {
-    int new_status = (ac ? AC_STATUS_CHANGED : BATTERY_STATUS_CHANGED);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    if (ac) {
-        switch (property) {
-            case POWER_SUPPLY_PROP_ONLINE:
-                battery_state->ac_online = value;
-                break;
-        }
-    } else {
-         switch (property) {
-            case POWER_SUPPLY_PROP_STATUS:
-                battery_state->status = value;
-                break;
-            case POWER_SUPPLY_PROP_HEALTH:
-                battery_state->health = value;
-                break;
-            case POWER_SUPPLY_PROP_PRESENT:
-                battery_state->present = value;
-                break;
-            case POWER_SUPPLY_PROP_CAPACITY:
-                battery_state->capacity = value;
-                break;
-        }
-    }
-
-    if (new_status != battery_state->int_status) {
-        battery_state->int_status |= new_status;
-        goldfish_device_set_irq(&battery_state->dev, 0, (battery_state->int_status & battery_state->int_enable));
-    }
+    dc->realize = goldfish_battery_realize;
+    dc->vmsd = &goldfish_battery_vmsd;
+    dc->desc = "goldfish battery";
 }
 
-void goldfish_battery_display(void (* callback)(void *data, const char* string), void *data)
+static const TypeInfo goldfish_audio_info = {
+    .name          = TYPE_GOLDFISH_BATTERY,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(struct goldfish_battery_state),
+    .class_init    = goldfish_battery_class_init,
+};
+
+static void goldfish_audio_register(void)
 {
-    char          buffer[100];
-    const char*   value;
-
-    sprintf(buffer, "AC: %s\r\n", (battery_state->ac_online ? "online" : "offline"));
-    callback(data, buffer);
-
-    switch (battery_state->status) {
-	    case POWER_SUPPLY_STATUS_CHARGING:
-	        value = "Charging";
-	        break;
-	    case POWER_SUPPLY_STATUS_DISCHARGING:
-	        value = "Discharging";
-	        break;
-	    case POWER_SUPPLY_STATUS_NOT_CHARGING:
-	        value = "Not charging";
-	        break;
-	    case POWER_SUPPLY_STATUS_FULL:
-	        value = "Full";
-	        break;
-        default:
-	        value = "Unknown";
-	        break;
-    }
-    sprintf(buffer, "status: %s\r\n", value);
-    callback(data, buffer);
-
-    switch (battery_state->health) {
-	    case POWER_SUPPLY_HEALTH_GOOD:
-	        value = "Good";
-	        break;
-	    case POWER_SUPPLY_HEALTH_OVERHEAT:
-	        value = "Overhead";
-	        break;
-	    case POWER_SUPPLY_HEALTH_DEAD:
-	        value = "Dead";
-	        break;
-	    case POWER_SUPPLY_HEALTH_OVERVOLTAGE:
-	        value = "Overvoltage";
-	        break;
-	    case POWER_SUPPLY_HEALTH_UNSPEC_FAILURE:
-	        value = "Unspecified failure";
-	        break;
-        default:
-	        value = "Unknown";
-	        break;
-    }
-    sprintf(buffer, "health: %s\r\n", value);
-    callback(data, buffer);
-
-    sprintf(buffer, "present: %s\r\n", (battery_state->present ? "true" : "false"));
-    callback(data, buffer);
-
-    sprintf(buffer, "capacity: %d\r\n", battery_state->capacity);
-    callback(data, buffer);
+    type_register_static(&goldfish_audio_info);
 }
+
+type_init(goldfish_audio_register);
