@@ -16,17 +16,16 @@
 #include "ui/pixel_ops.h"
 #include "trace.h"
 
-/* milkymist-vgafb also uses RGB565, so borrow its drawfn helpers */
 #define BITS 8
-#include "milkymist-vgafb_template.h"
+#include "goldfish_fb_template.h"
 #define BITS 15
-#include "milkymist-vgafb_template.h"
+#include "goldfish_fb_template.h"
 #define BITS 16
-#include "milkymist-vgafb_template.h"
+#include "goldfish_fb_template.h"
 #define BITS 24
-#include "milkymist-vgafb_template.h"
+#include "goldfish_fb_template.h"
 #define BITS 32
-#include "milkymist-vgafb_template.h"
+#include "goldfish_fb_template.h"
 
 #define TYPE_GOLDFISH_FB "goldfish_fb"
 #define GOLDFISH_FB(obj) OBJECT_CHECK(struct goldfish_fb_state, (obj), TYPE_GOLDFISH_FB)
