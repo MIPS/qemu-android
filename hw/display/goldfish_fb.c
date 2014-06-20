@@ -323,6 +323,10 @@ static void goldfish_fb_write(void *opaque, hwaddr offset, uint64_t val,
                 //printf("FB_SET_BASE: rotation : %d => %d\n", s->rotation, s->set_rotation);
                 s->rotation = s->set_rotation;
             }
+            /* The guest is waiting for us to complete an update cycle
+             * and notify it, so make sure we do a redraw immediately.
+             */
+            graphic_hw_update(s->con);
             qemu_set_irq(s->irq, s->int_status & s->int_enable);
             break;
         case FB_SET_ROTATION:
