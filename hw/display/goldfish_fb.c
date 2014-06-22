@@ -206,6 +206,7 @@ static void goldfish_fb_update_display(void *opaque)
     {
         void *dst_line = surface_data(ds);
         memset( dst_line, 0, height*pitch );
+        ymin = 0;
         ymax = height-1;
     }
     else
