@@ -331,7 +331,7 @@ static bool adb_server_listen_incoming(int port)
     Error *err = NULL;
     int fd;
 
-    host_port = g_strdup_printf("localhost:%d", port);
+    host_port = g_strdup_printf("127.0.0.1:%d", port);
     fd = inet_listen(host_port, NULL, 0, SOCK_STREAM, 0, &err);
     if (fd < 0) {
         return false;
